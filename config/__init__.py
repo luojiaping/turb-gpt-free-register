@@ -195,6 +195,7 @@ _RELOADABLE_SUBMODULES = (
     "config.extract_link",
     "config.sub2api",
     "config.humanize",
+    "config.payment",
 )
 
 

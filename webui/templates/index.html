@@ -741,6 +741,7 @@
     .accounts-table-v2 .col-token { width: 100px; }
     .accounts-table-v2 .col-password { width: 120px; }
     .accounts-table-v2 .col-plan { width: 120px; }
+    .accounts-table-v2 .col-payment { width: 150px; }
     .accounts-table-v2 .col-note { width: 140px; }
     .accounts-table-v2 .col-small { width: 170px; }
     .accounts-table-v2 .col-status { width: 100px; }
@@ -777,10 +778,17 @@
     .accounts-table-v2 .col-email,
     .accounts-table-v2 .col-password,
     .accounts-table-v2 .col-plan,
+    .accounts-table-v2 .col-payment,
     .accounts-table-v2 .col-note,
     .accounts-table-v2 .col-agent,
     .accounts-table-v2 .col-actions {
       white-space: normal; overflow: visible; text-overflow: clip; vertical-align: middle;
+    }
+    .accounts-table-v2 .payment-cell { cursor: pointer; }
+    .accounts-table-v2 .payment-cell:hover .pill { filter: brightness(.97); }
+    .accounts-table-v2 .payment-method-tag {
+      display: inline-block; margin: 0 4px 2px 0; padding: 2px 8px;
+      border-radius: 999px; background: #eaf5ec; color: #1f7a3d; font-size: 12px;
     }
     .accounts-table-v2 .acc-v2-email {
       font-weight: 700; color: #303133; line-height: 1.35;
@@ -2266,6 +2274,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCheckSelectedPaymentV2" disabled title="按区域线路创建 plus-1-month-free Custom Checkout，读取选中账号可用的支付方式（只建单不付款）">检测支付类型</button>
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">Codex</span>
@@ -2295,7 +2304,7 @@
         <table class="accounts-table-v2">
           <colgroup>
             <col class="col-check"><col class="col-id"><col class="col-email"><col class="col-source">
-            <col class="col-token"><col class="col-password"><col class="col-plan"><col class="col-note"><col class="col-small">
+            <col class="col-token"><col class="col-password"><col class="col-plan"><col class="col-payment"><col class="col-note"><col class="col-small">
             <col class="col-status"><col class="col-time"><col class="col-actions">
           </colgroup>
           <thead>
@@ -2307,6 +2316,7 @@
               <th class="col-token">Token</th>
               <th class="col-password">密码</th>
               <th class="col-plan">套餐</th>
+              <th class="col-payment">支付类型</th>
               <th class="col-note">备注</th>
               <th class="col-small">2FA</th>
               <th class="col-status">Codex</th>
@@ -3339,10 +3349,13 @@ async function pollAccountPlanStatuses() {
         const isChecking = ['queued', 'running'].includes(item.plan_check_status);
         const wasExtracting = ['queued', 'running'].includes(account?.extract_link_status);
         const isExtracting = ['queued', 'running'].includes(item.extract_link_status);
+        const wasPaying = ['queued', 'running'].includes(account?.payment_check_status);
+        const isPaying = ['queued', 'running'].includes(item.payment_check_status);
         const wasAgenting = ['queued', 'running'].includes(account?.codex_agent_status);
         const isAgenting = ['queued', 'running'].includes(item.codex_agent_status);
         if (wasChecking && !isChecking) needsFullReload = true;
         if (wasExtracting && !isExtracting) needsFullReload = true;
+        if (wasPaying && !isPaying) needsFullReload = true;
         if (wasAgenting && !isAgenting) needsFullReload = true;
         Object.assign(account, item);
       });
@@ -3557,6 +3570,57 @@ function _extractLinkAction(r) {
   const failedReason = s === 'failed' ? (r.extract_link_error || r.extract_link_message || '') : '';
   return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '为该 free(可Plus试用) 账号创建 PIX/UPI/KAKAO_PAY/IDEAL 提链任务')}">提链</button>`;
 }
+function _paymentStatusLabel(status) {
+  const labels = {
+    available: '已返回',
+    partial: '部分返回',
+    not_returned: '未返回',
+    already_paid: '已是付费账号',
+    token_invalid: 'Token 失效',
+    checkout_rejected: '建单被拒',
+    risk_blocked: '风控拦截',
+    rate_limited: '请求限流',
+    disabled: '未配置线路',
+    proxy_unavailable: '代理不可用',
+    proxy_country_mismatch: '出口不符',
+    unknown: '未检测',
+  };
+  return labels[status] || status || '未检测';
+}
+function _paymentCell(r) {
+  const checkStatus = r.payment_check_status || '';
+  if (['queued', 'running'].includes(checkStatus)) {
+    const label = checkStatus === 'queued' ? '检测排队中' : '检测中';
+    return `<span class="pill status-running">${label}</span>`;
+  }
+  const status = r.payment_status || '';
+  const methods = Array.isArray(r.payment_methods) ? r.payment_methods : [];
+  const err = r.payment_error || '';
+  const meta = [];
+  if (r.payment_country || r.payment_currency) meta.push(`${r.payment_country || '-'}/${r.payment_currency || '-'}`);
+  if (r.payment_exit) meta.push(`出口 ${r.payment_exit}`);
+  if (r.payment_session_type) meta.push(r.payment_session_type);
+  if (r.payment_checked_at) meta.push(`检测 ${r.payment_checked_at}`);
+  const title = [err, meta.join(' · '), '点击可重新检测'].filter(Boolean).join('；');
+  let inner = '';
+  if (methods.length) {
+    inner = methods.map(m => `<span class="payment-method-tag">${esc(m)}</span>`).join('');
+    if (status === 'partial') inner += `<div class="acc-v2-sub">部分线路完成</div>`;
+  } else if (checkStatus === 'failed' || ['token_invalid', 'risk_blocked', 'rate_limited', 'checkout_rejected', 'disabled', 'proxy_unavailable', 'proxy_country_mismatch', 'unknown'].includes(status)) {
+    const reason = err || _paymentStatusLabel(status);
+    inner = `<span class="pill status-failed" title="${esc(reason)}">${esc(_paymentStatusLabel(status))}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div>`;
+  } else if (status) {
+    inner = `<span class="pill status-used">${esc(_paymentStatusLabel(status))}</span>`;
+  } else {
+    return `<div class="payment-cell" data-payment-check="${esc(r.id)}" title="${esc(title)}"><span class="acc-v2-muted">未检测</span></div>`;
+  }
+  return `<div class="payment-cell" data-payment-check="${esc(r.id)}" title="${esc(title)}">${inner}</div>`;
+}
+function _paymentAction(r) {
+  const s = r.payment_check_status || '';
+  if (['queued', 'running'].includes(s)) return `<button type="button" disabled title="支付类型检测正在执行">检测中…</button>`;
+  return `<button type="button" data-payment-check="${esc(r.id)}" title="按区域线路创建 plus-1-month-free Custom Checkout，读取当前账号可用支付方式（只建单不付款）">检测支付类型</button>`;
+}
 function _codexAction(r) {
   const s = r.codex_status || '';
   if (s === 'retrying') {
@@ -3593,6 +3657,7 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-totp-log="${esc(r.email)}" title="查看该账号最近一次 2FA 设置日志">2FA日志</button>`,
     _planAction(r),
     _extractLinkAction(r),
+    _paymentAction(r),
     _codexAction(r),
     `<button type="button" data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button>`,
     `<button type="button" data-account-archive="${esc(r.id)}" data-archived="${r.archived ? '0' : '1'}" title="${r.archived ? '恢复到默认账号列表' : '归档后默认账号列表不再显示'}">${r.archived ? '恢复' : '归档'}</button>`,
@@ -3639,6 +3704,7 @@ function renderAccounts() {
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
+      <td class="col-payment">${_paymentCell(r)}</td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
@@ -3656,7 +3722,7 @@ function renderAccounts() {
 
   const bodyV2 = $('#accountsBodyV2');
   if (bodyV2) {
-    bodyV2.innerHTML = rows.map(rowHtmlV2).join('') || '<tr><td colspan="12" style="text-align:center;color:#909399;padding:28px;">暂无账号</td></tr>';
+    bodyV2.innerHTML = rows.map(rowHtmlV2).join('') || '<tr><td colspan="13" style="text-align:center;color:#909399;padding:28px;">暂无账号</td></tr>';
   }
   updateAccountSelectionUi(rows);
   _renderPager('accounts', total);
@@ -3670,7 +3736,7 @@ function updateAccountSelectionUi(pageRows = null) {
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
-    'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
+    'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2', 'btnCheckSelectedPaymentV2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnSetupSelectedTotpV2', 'btnChangeSelectedEmailsV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
@@ -3941,6 +4007,12 @@ async function onAccountsBodyClick(e) {
   const extractBtn = e.target.closest('[data-extract-link]');
   if (extractBtn) {
     await extractOneLink(Number(extractBtn.dataset.extractLink), extractBtn);
+    return;
+  }
+
+  const paymentBtn = e.target.closest('[data-payment-check]');
+  if (paymentBtn) {
+    await checkOnePayment(Number(paymentBtn.dataset.paymentCheck), paymentBtn);
     return;
   }
 
@@ -4534,6 +4606,47 @@ async function checkOnePlan(id, btn) {
   }
 }
 
+async function checkOnePayment(id, btn) {
+  const isButton = btn && btn.tagName === 'BUTTON';
+  const old = isButton ? btn.textContent : '';
+  if (isButton) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    await api('/api/accounts/payment-methods-check', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids:[id]}),
+    });
+    showToast('支付类型检测已入队');
+    await pollAccountPlanStatuses();
+  } catch(err) {
+    showToast('支付检测失败: ' + err.message);
+    if (isButton) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+async function checkSelectedPayment() {
+  const ids = Array.from(ACCOUNT_SELECTED);
+  if (ids.length === 0) { showToast('请先选择账号'); return; }
+  const btn = $('#btnCheckSelectedPaymentV2');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    const r = await api('/api/accounts/payment-methods-check', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids}),
+    });
+    const skipped = r.skipped_count || 0;
+    showToast(skipped ? `已入队 ${r.started_count || 0} 个，跳过 ${skipped} 个` : `已入队 ${r.started_count || 0} 个`);
+    await pollAccountPlanStatuses();
+  } catch(err) {
+    showToast('批量支付检测失败: ' + err.message);
+  } finally {
+    if (btn) { btn.textContent = old; }
+    updateAccountSelectionUi();
+  }
+}
+
 async function extractOneLink(id, btn) {
   const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
   if (!acc) { showToast('账号不存在'); return; }
@@ -5074,6 +5187,7 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   };
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
+  bind('btnCheckSelectedPaymentV2', checkSelectedPayment);
   bind('btnRetrySelectedCodexV2', retrySelectedCodex);
   bind('btnDownloadSelectedCpaV2', downloadSelectedCpa);
   bind('btnStopSelectedCodexV2', stopSelectedCodex);

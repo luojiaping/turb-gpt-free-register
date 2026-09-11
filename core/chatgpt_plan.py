@@ -17,6 +17,61 @@ from core.session import BrowserSession
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+CHATGPT_HOME_URL = "https://chatgpt.com/"
+
+
+def _looks_like_cf_challenge(text: str) -> bool:
+    """判断响应体是否像 Cloudflare 挑战/拦截页（而非正常 JSON）。"""
+    sample = str(text or "")[:4000].lower()
+    if not sample:
+        return False
+    if sample.lstrip().startswith(("{", "[")):
+        return False
+    markers = (
+        "challenge-platform",
+        "challenges.cloudflare.com",
+        "cf-chl",
+        "cf_chl",
+        "turnstile",
+        "just a moment",
+        "checking your browser",
+        "cdn-cgi/challenge",
+    )
+    return any(marker in sample for marker in markers)
+
+
+def _warm_up_chatgpt_session(env: BrowserSession, timeout: float) -> tuple[int, str]:
+    """访问 ChatGPT 首页预热 Cloudflare cookie（__cf_bm），返回 (status, text)。
+
+    套餐查询冷启动直接打 backend-api 时，若出口 IP 风险偏高会被 CF 返回挑战页；
+    先访问首页拿到 __cf_bm 后可显著降低 403 概率（与登录态 bootstrap 同理）。
+    """
+    try:
+        headers = env._get_common_headers()
+        headers.update({
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "referer": "https://chatgpt.com/",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "upgrade-insecure-requests": "1",
+        })
+        resp = env.session.get(
+            CHATGPT_HOME_URL,
+            headers=headers,
+            timeout=min(10.0, max(3.0, float(timeout or 5.0))),
+        )
+        try:
+            env._observe_cf_cookie_changes(CHATGPT_HOME_URL)
+        except Exception:
+            pass
+        try:
+            body = resp.text or ""
+        except Exception:
+            body = ""
+        return int(getattr(resp, "status_code", 0) or 0), body
+    except Exception as exc:
+        return 0, f"{type(exc).__name__}: {exc}"
 
 
 def now_iso() -> str:
@@ -293,7 +348,7 @@ def _plan_check_settings(
 def _retryable_plan_error(http_status: int | None) -> bool:
     if http_status is None:
         return True
-    return http_status in {408, 409, 425, 429} or http_status >= 500
+    return http_status in {403, 408, 409, 425, 429} or http_status >= 500
 
 
 def _retry_wait_seconds(resp: Any, base_delay: float, attempt: int) -> float:
@@ -356,55 +411,72 @@ def check_account_plan(
 
     last_result: dict | None = None
     account_seed = f"account:{(claims.get('email') or claims.get('account_id') or normalize_token(token)[:32]).lower()}"
-    for attempt in range(1, attempts + 1):
+    attempt = 0
+    while attempt < attempts:
+        attempt += 1
         env = None
         resp = None
         try:
             # 套餐查询只需要稳定的请求头，不需要额外访问 IP 地理信息接口。
             env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False, fingerprint_seed=account_seed)
-            resp = env.session.get(
-                url,
-                headers=_common_headers(env, token),
-                allow_redirects=False,
-                timeout=timeout_seconds,
-            )
-            response_text = resp.text or ""
-            http_status = int(resp.status_code)
-            if not (200 <= http_status < 300):
-                is_auth_expired = http_status == 401
+            # 先访问首页预热 CF cookie；冷启动直打 backend-api 在 IP 风险偏高时会 403。
+            warm_status, warm_text = _warm_up_chatgpt_session(env, timeout_seconds)
+            if warm_status in (403, 429) or _looks_like_cf_challenge(warm_text):
                 last_result = {
                     "ok": False,
                     "checked_at": now_iso(),
-                    "http_status": http_status,
-                    "error": "AT已过期/失效，请手动查活刷新" if is_auth_expired else f"HTTP {http_status}",
-                    "response_preview": response_text[:500],
-                    "retryable": _retryable_plan_error(http_status),
-                    "token_expired": True if is_auth_expired else claims.get("token_expired"),
-                    "needs_live_check": True if is_auth_expired else False,
+                    "http_status": warm_status or None,
+                    "error": f"CF 挑战未通过（预热 HTTP {warm_status or '请求失败'}）",
+                    "response_preview": str(warm_text)[:500],
+                    "retryable": True,
+                    "cf_challenge": True,
                 }
             else:
-                try:
-                    data: Any = resp.json()
-                except Exception:
-                    data = json.loads(response_text) if response_text.strip().startswith(("{", "[")) else None
-                if not isinstance(data, dict):
+                resp = env.session.get(
+                    url,
+                    headers=_common_headers(env, token),
+                    allow_redirects=False,
+                    timeout=timeout_seconds,
+                )
+                response_text = resp.text or ""
+                http_status = int(resp.status_code)
+                if not (200 <= http_status < 300):
+                    is_auth_expired = http_status == 401
+                    is_cf_challenge = http_status in (403, 429) and _looks_like_cf_challenge(response_text)
                     last_result = {
                         "ok": False,
                         "checked_at": now_iso(),
                         "http_status": http_status,
-                        "error": "响应不是 JSON 对象",
+                        "error": "AT已过期/失效，请手动查活刷新" if is_auth_expired else f"HTTP {http_status}",
                         "response_preview": response_text[:500],
-                        "retryable": True,
+                        "retryable": _retryable_plan_error(http_status),
+                        "cf_challenge": is_cf_challenge,
+                        "token_expired": True if is_auth_expired else claims.get("token_expired"),
+                        "needs_live_check": True if is_auth_expired else False,
                     }
                 else:
-                    parsed = parse_accounts_check(data, token=token)
-                    parsed["http_status"] = http_status
-                    parsed["attempt_count"] = attempt
-                    parsed["max_attempts"] = attempts
-                    parsed["request_timeout"] = timeout_seconds
-                    parsed["retryable"] = False
-                    parsed.update(route_meta)
-                    return parsed
+                    try:
+                        data: Any = resp.json()
+                    except Exception:
+                        data = json.loads(response_text) if response_text.strip().startswith(("{", "[")) else None
+                    if not isinstance(data, dict):
+                        last_result = {
+                            "ok": False,
+                            "checked_at": now_iso(),
+                            "http_status": http_status,
+                            "error": "响应不是 JSON 对象",
+                            "response_preview": response_text[:500],
+                            "retryable": True,
+                        }
+                    else:
+                        parsed = parse_accounts_check(data, token=token)
+                        parsed["http_status"] = http_status
+                        parsed["attempt_count"] = attempt
+                        parsed["max_attempts"] = attempts
+                        parsed["request_timeout"] = timeout_seconds
+                        parsed["retryable"] = False
+                        parsed.update(route_meta)
+                        return parsed
         except Exception as exc:
             logger.debug("套餐查询失败: %s: %s", type(exc).__name__, exc, exc_info=True)
             last_result = {
@@ -422,6 +494,9 @@ def check_account_plan(
                     pass
 
         last_result = last_result or {"ok": False, "checked_at": now_iso(), "error": "未知错误", "retryable": True}
+        # CF 挑战属于临时风控，至少给 3 次尝试机会。
+        if last_result.get("cf_challenge") and attempts < 3:
+            attempts = 3
         last_result.update({
             "attempt_count": attempt,
             "max_attempts": attempts,
@@ -433,6 +508,9 @@ def check_account_plan(
             return last_result
 
         wait_seconds = _retry_wait_seconds(resp, base_delay, attempt)
+        # 403（CF 挑战）退避拉长到 6s×次数，给风控一点冷却时间。
+        if int(last_result.get("http_status") or 0) == 403:
+            wait_seconds = max(wait_seconds, min(30.0, 6.0 * attempt))
         logger.warning(
             "套餐查询临时失败，第 %s/%s 次，%.1fs 后重试: %s",
             attempt,

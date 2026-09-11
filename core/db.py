@@ -20,6 +20,8 @@ _LEGACY_DATA_DIR = _PROJECT_ROOT / "data"
 _LOG_DIR = _PROJECT_ROOT / "注册日志"
 _PLAN_CHECK_STALE_SECONDS = 120
 _PLAN_CHECK_QUEUE_STALE_SECONDS = 1800
+_PAYMENT_CHECK_STALE_SECONDS = 300
+_PAYMENT_CHECK_QUEUE_STALE_SECONDS = 1800
 
 _OUTLOOK_JSON = _PROJECT_ROOT / "用于注册的邮箱.json"
 _OUTLOOK_TXT = _PROJECT_ROOT / "用于注册的邮箱.txt"
@@ -705,6 +707,20 @@ def _decorate_account(row: dict) -> dict:
             out["plan_check_status"] = "failed"
             out["plan_check_error"] = "上次套餐查询状态异常，可重新查询"
             out["plan_check_stale"] = True
+    payment_check_status = out.get("payment_check_status")
+    if payment_check_status in {"queued", "running"}:
+        try:
+            stamp_key = "payment_check_queued_at" if payment_check_status == "queued" else "payment_check_started_at"
+            stale_after = _PAYMENT_CHECK_QUEUE_STALE_SECONDS if payment_check_status == "queued" else _PAYMENT_CHECK_STALE_SECONDS
+            started_at = datetime.fromisoformat(str(out.get(stamp_key) or ""))
+            if (datetime.now() - started_at).total_seconds() >= stale_after:
+                out["payment_check_status"] = "failed"
+                out["payment_check_error"] = "上次支付类型检测状态已超时，可重新检测"
+                out["payment_check_stale"] = True
+        except (TypeError, ValueError):
+            out["payment_check_status"] = "failed"
+            out["payment_check_error"] = "上次支付类型检测状态异常，可重新检测"
+            out["payment_check_stale"] = True
     out["copy_line"] = _account_line(out)
     return out
 
@@ -1195,6 +1211,120 @@ def recover_interrupted_plan_checks() -> int:
         return recovered
 
 
+def claim_account_payment_check(
+    acc_id: int | None = None,
+    email: str | None = None,
+    trigger: str = "manual",
+) -> bool:
+    """原子占用账号的支付类型检测；已有未超时检测时返回 False。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        target_email = (email or "").lower()
+        row = next((
+            r for r in accounts
+            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
+            or (target_email and (r.get("email") or "").lower() == target_email)
+        ), None)
+        if row is None:
+            return False
+
+        current_status = row.get("payment_check_status")
+        if current_status in {"queued", "running"}:
+            try:
+                stamp_key = "payment_check_queued_at" if current_status == "queued" else "payment_check_started_at"
+                stale_after = _PAYMENT_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PAYMENT_CHECK_STALE_SECONDS
+                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                if (datetime.now() - started_at).total_seconds() < stale_after:
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        now = _now()
+        row["payment_check_status"] = "queued"
+        row["payment_check_trigger"] = str(trigger or "manual")
+        row["payment_check_queued_at"] = now
+        row["payment_check_started_at"] = None
+        row["payment_check_completed_at"] = None
+        row["payment_check_error"] = None
+        row["payment_check_ok"] = None
+        row["updated_at"] = now
+        _save_accounts(accounts)
+        return True
+
+
+def mark_account_payment_check_running(acc_id: int) -> bool:
+    """把已排队的支付类型检测标记为执行中。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or row.get("payment_check_status") not in {"queued", "running"}:
+            return False
+        row["payment_check_status"] = "running"
+        row["payment_check_started_at"] = _now()
+        row["payment_check_error"] = None
+        row["updated_at"] = _now()
+        _save_accounts(accounts)
+        return True
+
+
+def recover_interrupted_payment_checks() -> int:
+    """服务启动时把上次进程遗留的支付检测状态恢复为可重试失败。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        recovered = 0
+        now = _now()
+        for row in accounts:
+            if row.get("payment_check_status") not in {"queued", "running"}:
+                continue
+            row["payment_check_status"] = "failed"
+            row["payment_check_ok"] = False
+            row["payment_check_error"] = "WebUI 重启导致支付类型检测中断，请重新检测"
+            row["payment_check_completed_at"] = now
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(accounts)
+        return recovered
+
+
+def update_account_payment_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
+    """更新账号支付类型检测结果。
+
+    status/state/methods 等为检测聚合结果（available/partial/not_returned/
+    already_paid/token_invalid/risk_blocked/rate_limited/checkout_rejected/...）。
+    """
+    result = result or {}
+    with _LOCK:
+        accounts = _load_accounts()
+        target_email = (email or "").lower()
+        row = next((
+            r for r in accounts
+            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
+            or (target_email and (r.get("email") or "").lower() == target_email)
+        ), None)
+        if row is None:
+            return False
+
+        ok = bool(result.get("ok"))
+        row["payment_check_status"] = "success" if ok else "failed"
+        row["payment_check_ok"] = ok
+        row["payment_status"] = result.get("status") or ("unknown" if ok else "failed")
+        row["payment_state"] = result.get("state") or ""
+        row["payment_methods"] = list(result.get("methods") or [])
+        row["payment_checked_at"] = result.get("checked_at") or _now()
+        row["payment_check_completed_at"] = _now()
+        row["payment_exit"] = result.get("exit") or ""
+        row["payment_error"] = None if ok else (result.get("error") or "支付类型检测失败")
+        row["payment_http_status"] = result.get("http_status")
+        row["payment_session_type"] = result.get("session_type") or ""
+        row["payment_country"] = result.get("country") or ""
+        row["payment_currency"] = result.get("currency") or ""
+        row["payment_routes"] = list(result.get("routes") or [])
+        row["updated_at"] = _now()
+        _save_accounts(accounts)
+        return True
+
+
 def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
@@ -1522,6 +1652,11 @@ def list_account_plan_check_statuses(
         "totp_setup_started_at", "totp_setup_completed_at", "totp_setup_checked_at",
         "original_email", "email_source", "email_change_status", "email_change_ok",
         "email_change_error", "email_change_new_email", "email_change_started_at", "email_change_completed_at",
+        "payment_check_status", "payment_check_ok", "payment_check_error",
+        "payment_check_trigger", "payment_check_queued_at", "payment_check_started_at",
+        "payment_check_completed_at", "payment_status", "payment_state",
+        "payment_methods", "payment_checked_at", "payment_exit", "payment_http_status",
+        "payment_session_type", "payment_country", "payment_currency", "payment_error",
     )
     with _LOCK:
         limit = max(1, int(limit))
@@ -1590,6 +1725,13 @@ def list_account_plan_check_statuses(
                     "email_source": row.get("email_source"),
                     "email_change_status": row.get("email_change_status"),
                     "email_change_error": row.get("email_change_error"),
+                    "payment_check_status": row.get("payment_check_status"),
+                    "payment_check_ok": row.get("payment_check_ok"),
+                    "payment_check_error": row.get("payment_check_error"),
+                    "payment_status": row.get("payment_status"),
+                    "payment_state": row.get("payment_state"),
+                    "payment_methods": row.get("payment_methods"),
+                    "payment_checked_at": row.get("payment_checked_at"),
                 }
                 for row in rows
             ],

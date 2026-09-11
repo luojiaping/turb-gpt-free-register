@@ -782,6 +782,23 @@ def _submit_email_step(driver, email: str | None = None) -> None:
     # Roxy/Chrome 150 下 execute_async_script + fetch 偶发卡到 script timeout；
     # 实测 UI 首次提交后若停在 /auth/login?email=...，由 _recover_email_submit_if_stuck 补交表单更稳定。
     email_value = str(email or _current_email_input_value(driver) or "").strip()
+
+    # Cloak/Playwright 适配层 execute_async_script 带超时保护，且 UI 提交生成
+    # 的 authorize URL 在无头环境会缺 ext-passkey-client-capabilities（导致
+    # auth.openai.com 返回 400 invalid_authorize_request）。因此 Cloak 优先走
+    # NextAuth fetch 生成带完整参数的 authorize URL；Roxy 保持 UI 提交。
+    if getattr(driver, "__class__", None) and driver.__class__.__name__ == "CloakSeleniumDriver":
+        if email_value:
+            nextauth = _submit_email_via_browser_nextauth(driver, email_value)
+            if nextauth.get("ok"):
+                logger.info("%s 邮箱 NextAuth 提交成功（authorize URL 已带 passkey 上下文）：%s", _log_prefix(driver), nextauth)
+                time.sleep(1.0)
+                _assert_not_external_idp(driver, "NextAuth 提交邮箱后")
+                return
+            logger.warning("%s 邮箱 NextAuth 提交失败，回退 UI 表单提交：%s", _log_prefix(driver), nextauth)
+        else:
+            logger.warning("%s 邮箱值为空，跳过 NextAuth 提交", _log_prefix(driver))
+
     stable = _stabilize_email_input_before_submit(driver, email_value)
     logger.info("%s 邮箱提交前状态稳定：%s", _log_prefix(driver), stable)
     time.sleep(random.uniform(0.8, 1.8) if _browser_actions_enabled() else 0.4)
@@ -956,6 +973,63 @@ def _is_email_login_page_still_present(driver) -> bool:
     return bool(state.get("inputs"))
 
 
+def _is_cloudflare_challenge_page(driver) -> bool:
+    """检测当前页面是否为 Cloudflare 挑战/等待页（Turnstile 托管挑战）。
+
+    命中特征：标题（Just a moment / しばらくお待ちください / 请稍候 等）、
+    挑战容器 DOM、challenge-platform 脚本、challenges.cloudflare.com iframe、
+    或 URL 落入 /cdn-cgi/。
+    """
+    try:
+        result = driver.execute_script(r"""
+        const info = {title: '', titleHit: false, domHit: false, urlHit: false};
+        try { info.title = String(document.title || ''); } catch (e) {}
+        const t = info.title.toLowerCase();
+        info.titleHit = /just a moment|请稍候|しばらくお待ちください|attention required|verifying you are human|checking your browser|验证您是人类/.test(t);
+        try {
+          info.domHit = !!(document.querySelector('#challenge-running,#challenge-stage,#cf-please-wait,#challenge-form,#challenge-error-text')
+            || document.querySelector('script[src*="challenge-platform"]')
+            || document.querySelector('iframe[src*="challenges.cloudflare.com"]'));
+        } catch (e) {}
+        try { info.urlHit = /\/cdn-cgi\//.test(location.href); } catch (e) {}
+        return info;
+        """)
+    except Exception:
+        return False
+    if not isinstance(result, dict):
+        return False
+    return bool(result.get("titleHit") or result.get("domHit") or result.get("urlHit"))
+
+
+def _wait_cf_challenge_clear(driver, timeout: float = 60.0) -> bool:
+    """等待 Cloudflare 挑战页自动放行；返回 True 表示已离开挑战页。"""
+    end = time.time() + float(timeout or 0.0)
+    started = time.time()
+    next_log_at = 0.0
+    last_nudge_at = 0.0
+    while time.time() < end:
+        if not _is_cloudflare_challenge_page(driver):
+            elapsed = time.time() - started
+            if elapsed >= 0.5:
+                logger.info("%s Cloudflare 挑战已放行（等待 %.1fs）", _log_prefix(driver), elapsed)
+            return True
+        now = time.time()
+        if now >= next_log_at:
+            logger.info(
+                "%s 检测到 Cloudflare 挑战页，等待自动放行…剩余 %.0fs",
+                _log_prefix(driver), max(0.0, end - now),
+            )
+            next_log_at = now + 5.0
+        if now - last_nudge_at >= 4.0:
+            last_nudge_at = now
+            try:
+                driver.execute_script("window.scrollBy(0, %s);" % random.randint(20, 80))
+            except Exception:
+                pass
+        time.sleep(1.2)
+    return not _is_cloudflare_challenge_page(driver)
+
+
 def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     """邮箱提交后等待进入 password / otp / logged_in；仍停留邮箱页则返回 email_page。
 
@@ -966,13 +1040,34 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     这里对 email_cleared 做去抖：只记录并继续观察几秒；若期间进入
     password/otp/login_password/logged_in 则按真实状态返回，持续清空才让上层重试。
     """
-    end = time.time() + timeout
+    start = time.time()
+    end = start + timeout
+    # 命中 CF 挑战页时最多额外等 60s，给托管挑战自动放行的机会。
+    challenge_deadline = start + timeout + 60.0
+    challenge_log_at = 0.0
     last = None
     cleared_seen_at: float | None = None
     cleared_last_log_at = 0.0
     cleared_recover_done = False
     expected_email = str(email or "").strip().lower()
     while time.time() < end:
+        now = time.time()
+        if _is_cloudflare_challenge_page(driver):
+            if now < challenge_deadline:
+                if now >= challenge_log_at:
+                    logger.info(
+                        "%s 邮箱提交后检测到 Cloudflare 挑战页，继续等待放行（最多再等 %.0fs）",
+                        _log_prefix(driver), challenge_deadline - now,
+                    )
+                    challenge_log_at = now + 5.0
+                end = min(challenge_deadline, max(end, now + 2.0))
+                time.sleep(1.2)
+                continue
+            logger.warning(
+                "%s Cloudflare 挑战页在 %.0fs 内未放行，按超时处理",
+                _log_prefix(driver), challenge_deadline - start,
+            )
+            break
         if _has_access_token(driver):
             return "logged_in"
         if _is_login_password_page(driver):
@@ -1020,6 +1115,16 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
 
 
+def _is_navigation_destroyed_error(exc: Exception) -> bool:
+    """页面导航导致执行上下文销毁：调用侧应转入状态检查/重试，而非直接判失败。"""
+    try:
+        from core.cloakbrowser_driver import _is_navigation_destroyed_error as _impl
+        return bool(_impl(exc))
+    except Exception:
+        msg = str(exc).lower()
+        return "execution context was destroyed" in msg or "navigation" in msg
+
+
 def _submit_email_and_wait_next(
     driver,
     email: str | None,
@@ -1028,19 +1133,43 @@ def _submit_email_and_wait_next(
 ) -> str:
     """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
     last_state = None
+    challenge_stuck = False
     current_email = str(email or "").strip()
     for attempt in range(1, attempts + 1):
-        if current_email:
-            _type_email_address(driver, current_email, timeout=20)
-        else:
-            # 先确认页面已有可用输入框，再领取邮箱；不能把领取动作放在页面导航之前。
-            email_input = _wait_for_email_input(driver, timeout=20)
-            if email_supplier is None:
-                raise RuntimeError("已找到邮箱输入框，但未提供邮箱分配器")
-            current_email = str(email_supplier() or "").strip()
-            if not current_email:
-                raise RuntimeError("邮箱分配器返回了空邮箱地址")
-            _human_type_text(driver, email_input, current_email, clear=True)
+        if _is_cloudflare_challenge_page(driver):
+            # 上一轮卡在 CF 挑战页：先等放行再决定下一步，避免在无表单的挑战页上重填。
+            if _wait_cf_challenge_clear(driver, timeout=45.0):
+                state_name = _wait_email_submit_next_state(driver, current_email, timeout=10)
+                if state_name == "login_password":
+                    raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
+                if state_name in ("password", "otp", "logged_in"):
+                    logger.info("%s CF 挑战放行后已进入下一步：%s", _log_prefix(driver), state_name)
+                    return state_name
+            else:
+                logger.warning("%s CF 挑战在重试前仍未放行，继续等待下一轮", _log_prefix(driver))
+                challenge_stuck = True
+                continue
+        try:
+            if current_email:
+                _type_email_address(driver, current_email, timeout=20)
+            else:
+                # 先确认页面已有可用输入框，再领取邮箱；不能把领取动作放在页面导航之前。
+                email_input = _wait_for_email_input(driver, timeout=20)
+                if email_supplier is None:
+                    raise RuntimeError("已找到邮箱输入框，但未提供邮箱分配器")
+                current_email = str(email_supplier() or "").strip()
+                if not current_email:
+                    raise RuntimeError("邮箱分配器返回了空邮箱地址")
+                _human_type_text(driver, email_input, current_email, clear=True)
+        except Exception as exc:
+            if not _is_navigation_destroyed_error(exc):
+                raise
+            # 填写过程中页面发生导航（可能已跳到 password/otp）：不判失败，
+            # 直接进入下面的状态校验，由等待循环确认真实状态。
+            logger.info(
+                "%s 邮箱填写中页面发生导航，跳过本次写入校验直接检查状态：%s",
+                _log_prefix(driver), type(exc).__name__,
+            )
         state = _email_input_value_state(driver)
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
@@ -1050,7 +1179,17 @@ def _submit_email_and_wait_next(
             continue
         logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), current_email)
         human_delay("form")
-        _submit_email_step(driver, current_email)
+        try:
+            _submit_email_step(driver, current_email)
+        except Exception as exc:
+            if not _is_navigation_destroyed_error(exc):
+                raise
+            # 提交瞬间页面发生导航（提交很可能已触发）：不判失败，
+            # 直接进入等待，由状态循环确认是否已进入下一步；否则重试。
+            logger.info(
+                "%s 邮箱提交瞬间页面发生导航，直接进入下一步等待确认：%s",
+                _log_prefix(driver), type(exc).__name__,
+            )
         logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
         state_name = _wait_email_submit_next_state(driver, current_email, timeout=20)
         if state_name == "login_password":
@@ -1058,8 +1197,11 @@ def _submit_email_and_wait_next(
         if state_name in ("password", "otp", "logged_in"):
             logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
             return state_name
+        challenge_stuck = _is_cloudflare_challenge_page(driver)
         logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
         time.sleep(1.0)
+    if challenge_stuck:
+        raise RuntimeError(f"邮箱提交后停留在 Cloudflare 挑战页且未放行，最后状态={last_state}")
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
 
 

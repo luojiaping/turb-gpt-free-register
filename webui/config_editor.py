@@ -18,6 +18,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
 EXPLICIT_EMPTY_LIST_KEYS = {
     "PROXY_POOL",
+    "PAYMENT_PROXY_ROUTES",
 }
 
 
@@ -699,6 +700,35 @@ EDITABLE_FIELDS = [
     {
         "key": "L_PHONE_PREFIX", "file": "codex.py", "type": "str", "group": "接码平台",
         "label": "L 号码前缀", "help": "L 返回号码不含国家码时填写，例如美国 10 位本地号填 1；留空则不补",
+    },
+    # ---- 支付检测 ----
+    {
+        "key": "PAYMENT_PROXY_ROUTES", "file": "payment.py", "type": "list_str_multiline", "group": "支付检测",
+        "label": "区域线路(每行一个)", "help": "格式：国家|币种|语言|代理，如 VN|VND|vi-VN|http://user:pass@host:port；DIRECT 或空代理视为禁用，不回退直连；相同前缀多行合并为代理池；最多 12 组",
+    },
+    {
+        "key": "PAYMENT_CHECK_MAX_ROUTES", "file": "payment.py", "type": "int", "group": "支付检测",
+        "label": "最大区域线路数", "help": "解析区域线路时的上限，默认 12",
+    },
+    {
+        "key": "PAYMENT_CHECK_MIN_INTERVAL_MS", "file": "payment.py", "type": "int", "group": "支付检测",
+        "label": "线路启动最小间隔(ms)", "help": "支付检测线路之间的全局最小启动间隔，默认 3000ms，降低 429 风险",
+    },
+    {
+        "key": "PAYMENT_CHECK_JITTER_MS", "file": "payment.py", "type": "int", "group": "支付检测",
+        "label": "线路启动随机抖动(ms)", "help": "在最小间隔上增加 0-N ms 随机延迟，默认 500ms",
+    },
+    {
+        "key": "PAYMENT_CHECK_TIMEOUT_SECONDS", "file": "payment.py", "type": "float", "group": "支付检测",
+        "label": "检测请求超时(秒)", "help": "支付检测单个 HTTP 请求超时，默认 45 秒",
+    },
+    {
+        "key": "PAYMENT_STRIPE_PUBLISHABLE_KEYS", "file": "payment.py", "type": "list_str_multiline", "group": "支付检测",
+        "label": "Stripe publishable keys", "help": "可选；Checkout 响应缺少 pk_ 时按顺序尝试这些 key，仍为空则尝试从 Stripe 收银台页面 HTML 中提取",
+    },
+    {
+        "key": "PAYMENT_SENTINEL_FLOW", "file": "payment.py", "type": "str", "group": "支付检测",
+        "label": "Sentinel flow", "help": "建单前获取 Sentinel 头使用的 flow，默认 checkout_session_creation；失败不影响检测",
     },
 ]
 

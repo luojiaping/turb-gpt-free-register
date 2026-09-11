@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,46 @@ from typing import Any
 from config import cloakbrowser as _cfg
 
 logger = logging.getLogger(__name__)
+
+# cloakbrowser.launch() 内含 sync_playwright().start()、node 子进程派生、
+# human 补丁全局标记、wrapper 更新检查等进程级共享状态，并发 launch 会互相
+# 干扰（曾导致 Playwright 报 "Sync API inside the asyncio loop" 并毒化线程）。
+# 这里把整个 launch 过程串行化；任务主体（页面操作）仍保持并发。
+_LAUNCH_LOCK = threading.Lock()
+
+# Selenium Keys 私有区字符 -> Playwright 按键名（None 表示无法映射，忽略）。
+_SELENIUM_KEYS = {
+    "\ue000": None,   # NULL
+    "\ue001": None,   # CANCEL
+    "\ue002": None,   # HELP
+    "\ue003": "Backspace",
+    "\ue004": "Tab",
+    "\ue005": None,   # CLEAR
+    "\ue006": "Enter",  # RETURN
+    "\ue007": "Enter",  # ENTER
+    "\ue008": "Shift",
+    "\ue009": "Control",
+    "\ue00a": "Alt",
+    "\ue00b": None,   # PAUSE
+    "\ue00c": "Escape",
+    "\ue00d": "Space",
+    "\ue00e": "PageUp",
+    "\ue00f": "PageDown",
+    "\ue010": "End",
+    "\ue011": "Home",
+    "\ue012": "ArrowLeft",
+    "\ue013": "ArrowUp",
+    "\ue014": "ArrowRight",
+    "\ue015": "ArrowDown",
+    "\ue016": "Insert",
+    "\ue017": "Delete",
+    "\ue03d": "Meta",  # COMMAND
+}
+
+
+def _platform_mod() -> str:
+    import sys
+    return "Meta" if sys.platform == "darwin" else "Control"
 
 
 @dataclass
@@ -73,7 +114,7 @@ class CloakElement:
         except Exception:
             # 部分非 input 元素不支持 fill，回退键盘清空。
             self.click()
-            self.page.keyboard.press("Meta+A")
+            self.page.keyboard.press(f"{_platform_mod()}+A")
             self.page.keyboard.press("Backspace")
 
     @property
@@ -83,20 +124,44 @@ class CloakElement:
         except Exception:
             return ""
 
-    def send_keys(self, *values: str) -> None:
-        # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
-        text = "".join(str(v or "") for v in values)
-        lower = text.lower()
+    @property
+    def text(self) -> str:
+        """兼容 Selenium WebElement.text：返回元素可见文本。"""
         try:
-            self.click()
+            return str(self._eval("el => el.innerText || el.textContent || ''") or "")
+        except Exception:
+            return ""
+
+    def _is_focused(self) -> bool:
+        """元素已是 document.activeElement 时返回 True，避免重复点击导致光标跳动。"""
+        try:
+            return bool(self._eval("el => document.activeElement === el"))
+        except Exception:
+            return False
+
+    def send_keys(self, *values: str) -> None:
+        # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a') / 逐字符追加。
+        # 注意：Selenium 的 send_keys 不会点击元素；只有在元素尚未聚焦时才点击，
+        # 否则每次逐字符输入前的中心点击会把光标跳到文本中间，导致字符乱序。
+        text = "".join(str(v or "") for v in values)
+        if not self._is_focused():
+            try:
+                self.click()
+            except Exception:
+                pass
+        if not text:
+            return
+        try:
+            self._type_keys(text)
+            return
         except Exception:
             pass
-        if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:
-            # Selenium Keys.CONTROL/COMMAND 编码可能传入私有区字符；这里按全选处理。
+        # 回退：无特殊键时用 fill 一次性设置；含特殊键时逐个降级为按键。
+        if any(ch in _SELENIUM_KEYS for ch in text):
             try:
-                self.page.keyboard.press("Meta+A")
+                self.page.keyboard.press(text.replace("\ue009", "Control").replace("\ue03d", "Meta"))
             except Exception:
-                self.page.keyboard.press("Control+A")
+                pass
             return
         try:
             if self.locator is not None:
@@ -105,6 +170,40 @@ class CloakElement:
                 self.handle.fill(text, timeout=10000)
         except Exception:
             self.page.keyboard.type(text, delay=35)
+
+    def _type_keys(self, text: str) -> None:
+        """按 Selenium Keys 语义发送按键：普通文本追加输入，特殊键映射为按键。"""
+        kb = self.page.keyboard
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch in _SELENIUM_KEYS:
+                key = _SELENIUM_KEYS[ch]
+                if key is None:
+                    # 无法映射的私有区字符，跳过（保持 Selenium 对 NULL 等无操作的语义）
+                    i += 1
+                    continue
+                if key in ("Control", "Meta"):
+                    # 组合键：mod + 紧随其后的普通字符，如 Ctrl+A / Cmd+A
+                    mod = "Control" if key == "Control" else "Meta"
+                    if i + 1 < n and text[i + 1] not in _SELENIUM_KEYS:
+                        kb.press(f"{mod}+{text[i + 1].upper()}")
+                        i += 2
+                        continue
+                    i += 1
+                    continue
+                kb.press(key)
+                i += 1
+                continue
+            # 普通文本段：累积后一次性输入，模拟真实打字节奏
+            j = i
+            buf = []
+            while j < n and text[j] not in _SELENIUM_KEYS:
+                buf.append(text[j])
+                j += 1
+            kb.type("".join(buf), delay=35)
+            i = j
 
     def get_attribute(self, name: str) -> str | None:
         try:
@@ -222,12 +321,21 @@ class CloakSeleniumDriver:
 
     def execute_cdp_cmd(self, cmd: str, params: dict | None = None) -> Any:
         params = params or {}
+        client = None
         try:
             client = self.context.new_cdp_session(self.page) if self.context is not None else self.page.context.new_cdp_session(self.page)
             return client.send(cmd, params)
         except Exception as exc:
             logger.debug("[Cloak] CDP 命令失败 %s: %s", cmd, exc)
             return None
+        finally:
+            # CDP session 必须 detach，否则每次调用泄漏一个 session，
+            # 累积会耗尽浏览器资源导致传输层冻结。
+            if client is not None:
+                try:
+                    client.detach()
+                except Exception:
+                    pass
 
     def _serialize_args(self, args: tuple[Any, ...]) -> tuple[CloakElement | None, list[Any]]:
         """拆分 Selenium 脚本参数。
@@ -258,13 +366,44 @@ class CloakSeleniumDriver:
         if element is not None:
             return CloakElement(page, handle=element)
         try:
-            return handle.json_value()
+            value = handle.json_value()
         except Exception as exc:
             msg = str(exc)
             if "Execution context was destroyed" in msg or "navigation" in msg.lower():
                 logger.info("[Cloak] JS 执行后页面发生跳转，忽略返回值读取失败：%s", msg[:160])
                 return {"ok": True, "reason": "navigation_after_script"}
             raise
+        try:
+            # 脚本返回 {input, button, target...} 这类嵌套 DOM 元素的 dict 时，
+            # json_value 会把元素压成 'ref: <Node>' 字符串（旧版本为 {}）。
+            # 逐 key 用 get_property 恢复为 CloakElement。
+            if isinstance(value, dict):
+                for dict_key in list(value.keys()):
+                    existing = value.get(dict_key)
+                    if existing is not None and existing != {} and not (
+                        isinstance(existing, str) and existing.startswith("ref:")
+                    ):
+                        continue
+                    try:
+                        prop = handle.get_property(str(dict_key))
+                    except Exception:
+                        continue
+                    try:
+                        prop_el = prop.as_element()
+                    except Exception:
+                        prop_el = None
+                    if prop_el is not None:
+                        # as_element 返回同一底层 handle，绝不能 dispose，
+                        # 否则刚恢复的元素立即失效。
+                        value[dict_key] = CloakElement(page, handle=prop_el)
+                    else:
+                        try:
+                            prop.dispose()
+                        except Exception:
+                            pass
+            return value
+        except Exception:
+            return value
         finally:
             try:
                 handle.dispose()
@@ -294,7 +433,13 @@ class CloakSeleniumDriver:
             if first_el is not None:
                 result = first_el._eval(element_wrapper, {"script": script, "args": serial_args})
             else:
-                result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+                try:
+                    result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+                except Exception as exc:
+                    if _is_navigation_destroyed_error(exc):
+                        logger.debug("[Cloak] 异步脚本执行中页面导航，返回空由调用侧重试")
+                        return None
+                    raise
             if isinstance(result, dict) and result.get("__cloak_timeout"):
                 raise TimeoutError("execute_async_script timeout")
             return result
@@ -312,8 +457,33 @@ class CloakSeleniumDriver:
         if first_el is not None:
             handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
         else:
-            handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+            try:
+                handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+            except Exception as exc:
+                if _is_navigation_destroyed_error(exc):
+                    # 调用瞬间页面发生导航：返回空 dict（falsy），调用侧轮询会重试。
+                    logger.debug("[Cloak] 同步脚本执行中页面导航，返回空由调用侧重试")
+                    return {}
+                raise
         return self._unwrap_js_result(self.page, handle)
+
+
+def _is_navigation_destroyed_error(exc: BaseException) -> bool:
+    """页面导航导致执行上下文销毁（调用侧轮询重试即可，不应直接判失败）。
+
+    注意：超时（TimeoutError）不在此列，必须继续向上传播。
+    """
+    msg = str(exc).lower()
+    return any(
+        fragment in msg
+        for fragment in (
+            "execution context was destroyed",
+            "navigation",
+            "target crashed",
+            "target closed",
+            "session closed",
+        )
+    )
 
 
 def _normalize_proxy(proxy: str | None) -> str | None:
@@ -392,13 +562,132 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
+def _cloak_chrome_processes() -> dict[int, str]:
+    """当前所有 Cloak Chromium 进程 {pid: commandline}（按可执行路径识别）。
+
+    用 wmic 一次取回路径与命令行；wmic 不可用时保守返回空 dict，不误杀。
+    """
+    import csv as _csv
+    import io as _io
+    import subprocess as _sp
+
+    try:
+        out = _sp.run(
+            ["wmic", "process", "where", "name='chrome.exe'",
+             "get", "ProcessId,ExecutablePath,CommandLine", "/format:csv"],
+            capture_output=True, text=True, timeout=25,
+        ).stdout
+    except Exception:
+        return {}
+    result: dict[int, str] = {}
+    try:
+        for row in _csv.reader(_io.StringIO(out or "")):
+            if len(row) < 4:
+                continue
+            if ".cloakbrowser" not in str(row[1] or "").lower():
+                continue
+            try:
+                pid = int(str(row[3]).strip())
+            except ValueError:
+                continue
+            result[pid] = str(row[2] or "")
+    except Exception:
+        return {}
+    return result
+
+
+def _cloak_chrome_pids() -> set[int]:
+    """当前所有 Cloak Chromium 进程 PID（按可执行路径识别）。"""
+    try:
+        return set(_cloak_chrome_processes().keys())
+    except Exception:
+        return set()
+
+
+def _extract_user_data_dir(cmdline: str) -> str:
+    """从 chrome 命令行提取 --user-data-dir（每次 launch 唯一，用于精确归因）。"""
+    try:
+        import re as _re
+        match = _re.search(r"--user-data-dir[=\s]+(\"[^\"]+\"|\S+)", str(cmdline or ""))
+        if not match:
+            return ""
+        return match.group(1).strip().strip('"').rstrip("\\/")
+    except Exception:
+        return ""
+
+
+def kill_cloak_browser_pids(pids: set[int] | list[int] | None) -> None:
+    """兜底关闭 Cloak 浏览器进程树（quit 超时且传输层冻结时使用）。"""
+    targets = [int(p) for p in (pids or []) if int(p or 0) > 0]
+    if not targets:
+        return
+    import subprocess
+
+    for pid in targets:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=15,
+            )
+            logger.info("[Cloak] 已兜底关闭浏览器进程树 pid=%s", pid)
+        except Exception as exc:
+            logger.debug("[Cloak] 兜底关闭浏览器失败 pid=%s: %s", pid, exc)
+
+
+def reap_cloak_browser(driver: Any) -> None:
+    """收尾回收：quit 后仍存活的本次浏览器进程按路径+user-data-dir 确认后强杀。
+
+    匹配规则（任一满足即杀，均为本次 launch 专属标识，不会误伤用户 Chrome
+    或其他并发任务的浏览器）：
+    1. 本次记录 PID ∩ 当前存活的 cloakbrowser 路径进程；
+    2. 命令行 --user-data-dir 落在本次记录的 data-dir 集合内。
+    """
+    try:
+        recorded = {int(p) for p in (getattr(driver, "_cloak_pids", None) or []) if int(p or 0) > 0}
+        data_dirs = {str(d) for d in (getattr(driver, "_cloak_data_dirs", None) or []) if str(d or "").strip()}
+    except Exception:
+        return
+    if not recorded and not data_dirs:
+        return
+    try:
+        alive = _cloak_chrome_processes()
+    except Exception:
+        return
+    targets = sorted(recorded & set(alive.keys()))
+    if data_dirs:
+        for pid, cmdline in alive.items():
+            if pid in targets:
+                continue
+            udd = _extract_user_data_dir(cmdline)
+            if udd and udd in data_dirs:
+                targets.append(pid)
+        targets.sort()
+    if not targets:
+        return
+    logger.info("[Cloak] quit 后仍有 %s 个浏览器进程存活，回收：%s", len(targets), targets)
+    kill_cloak_browser_pids(targets)
+
+
 def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
     proxy=None  时按 config.proxy.PROXY_POOL 随机抽取；
     proxy=""    时显式禁用代理；
     proxy="..." 时使用指定代理。
+
+    注意：整个 launch 过程持有进程级串行锁（见 _LAUNCH_LOCK），调用方无需额外同步。
     """
+    import os
+
+    # 关掉 cloakbrowser 每次 launch 的 wrapper 更新检查（进程级全局标记+网络请求，
+    # 并发 launch 下天然竞态）。用户如需更新，手动升级 cloakbrowser 包即可。
+    os.environ.setdefault("CLOAKBROWSER_AUTO_UPDATE", "false")
+    with _LAUNCH_LOCK:
+        return _build_cloak_driver_locked(proxy=proxy)
+
+
+def _build_cloak_driver_locked(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
+    """build_cloak_driver 的实际实现（调用时必须已持有 _LAUNCH_LOCK）。"""
     if proxy is None and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
         try:
             from config.proxy import pick_proxy
@@ -452,6 +741,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     if locale_opts.get("accept_language"):
         context_kwargs["extra_http_headers"] = {"Accept-Language": locale_opts["accept_language"]}
 
+    before_procs = _cloak_chrome_processes()
     if user_data_dir:
         context = launch_persistent_context(user_data_dir, **opts)
         page = context.new_page()
@@ -463,6 +753,20 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         page = context.new_page()
 
     driver = CloakSeleniumDriver(browser=browser, context=context, page=page)
+    # 记录本次启动新增的浏览器 PID 及其 user-data-dir，供收尾精确回收。
+    # user-data-dir 每次 launch 唯一，即使并发 launch 交错也不会张冠李戴。
+    try:
+        after_procs = _cloak_chrome_processes()
+        new_pids = sorted(set(after_procs) - set(before_procs))
+        driver._cloak_pids = new_pids
+        driver._cloak_data_dirs = sorted({
+            _extract_user_data_dir(after_procs[pid])
+            for pid in new_pids
+            if _extract_user_data_dir(after_procs.get(pid, ""))
+        })
+    except Exception:
+        driver._cloak_pids = []
+        driver._cloak_data_dirs = []
     # Roxy/Cloak 共用部分页面操作函数；给共享函数一个显式日志前缀，
     # 避免 Cloak 注册流程里出现 `[Roxy注册]`。
     driver._registration_log_prefix = "[Cloak注册]"

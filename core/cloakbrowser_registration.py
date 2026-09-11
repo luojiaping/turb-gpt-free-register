@@ -227,7 +227,17 @@ def run_cloak_registration(
         if data_saver is not None:
             data_saver.stop()
         if driver and not bool(_cfg.CLOAK_KEEP_BROWSER_OPEN):
+            # quit 必须在创建 driver 的工作线程直接调用：Playwright sync API
+            # 有线程亲和性，helper 线程调用必定部分失败（之前每次成功都靠收尸）。
+            # tracker.stop() 已改为纯缓存读取，teardown 不再有 wedge 触发点。
             try:
                 driver.quit()
+            except Exception as exc:
+                logger.debug("[Cloak注册] driver.quit 异常，转入进程回收：%s: %s",
+                             type(exc).__name__, str(exc)[:160])
+            # quit 返回不代表进程已退出；按路径+user-data-dir 确认后回收本次残留。
+            try:
+                from core.cloakbrowser_driver import reap_cloak_browser
+                reap_cloak_browser(driver)
             except Exception:
                 pass

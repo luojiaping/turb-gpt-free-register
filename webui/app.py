@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from flask import Flask, Response, jsonify, make_response, render_template, request
 import pyotp
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
+from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, payment_check_service
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -116,7 +116,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "user_name", "email_source", "original_email", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
-        "totp_setup_status",
+        "totp_setup_status", "payment_check_status", "payment_status",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -144,6 +144,11 @@ def _compact_account_for_list(row: dict) -> dict:
         "totp_setup_error", "totp_setup_message", "totp_setup_started_at", "totp_setup_completed_at",
         "email_change_status", "email_change_error", "email_change_new_email",
         "email_change_started_at", "email_change_completed_at",
+        # 支付类型检测补充：线路、出口、失败原因。
+        "payment_check_error", "payment_status", "payment_state", "payment_methods", "payment_checked_at",
+        "payment_error", "payment_exit", "payment_http_status", "payment_session_type",
+        "payment_country", "payment_currency", "payment_check_trigger",
+        "payment_check_queued_at", "payment_check_started_at", "payment_check_completed_at",
     )
     for key in optional_keys:
         value = row.get(key)
@@ -328,6 +333,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_email_changes = db.recover_interrupted_email_changes()
     if recovered_email_changes:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的邮箱换绑状态", recovered_email_changes)
+    recovered_payment_checks = db.recover_interrupted_payment_checks()
+    if recovered_payment_checks:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的支付类型检测状态", recovered_payment_checks)
 
     # ----------------------------------------------------------
     # 页面
@@ -440,6 +448,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         else:
             snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, date_from=date_from, date_to=date_to, totp_filter=totp_filter)
         snapshot["queue"] = plan_check_service.queue_settings()
+        snapshot["payment_queue"] = payment_check_service.queue_settings()
         return jsonify(snapshot)
 
 
@@ -968,6 +977,26 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped": skipped,
             "skipped_count": len(skipped),
         }), 202
+
+    @app.post("/api/accounts/payment-methods-check")
+    def api_accounts_payment_methods_check():
+        """支付类型检测。Body {ids:[...]} 或 {account_ids:[...]}。
+
+        接口名与请求体对齐文档；服务端同一时间只跑一个批次，立即返回排队结果，
+        检测结果写入账号 payment_* 字段，由前端轮询刷新。
+        """
+        data = request.get_json(silent=True) or {}
+        ids = data.get("ids") or data.get("account_ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "ids 必须是非空数组"}), 400
+        result = payment_check_service.submit_payment_check(
+            ids, trigger=str(data.get("trigger") or "manual"),
+        )
+        if result.get("busy"):
+            return jsonify({"ok": False, **result}), 409
+        if not result.get("accepted"):
+            return jsonify({"ok": False, **result}), 400
+        return jsonify({"ok": True, **result}), 202
 
     @app.get("/api/extract-link/cdk")
     def api_extract_link_cdk():

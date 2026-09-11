@@ -134,6 +134,30 @@ def _is_blockable_script_url(url: Any) -> bool:
         return False
 
 
+def run_with_timeout(fn: Any, timeout: float, label: str) -> tuple[bool, Any]:
+    """在 helper 线程执行 fn；超时则放弃线程并返回 (False, None)。
+
+    用于 Playwright teardown 阶段：传输层偶发 wedge 时不能让任务永久卡死。
+    放弃的线程为 daemon，随进程退出而回收。
+    """
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, daemon=True, name=f"traffic-{label}")
+    worker.start()
+    worker.join(max(1.0, float(timeout)))
+    if worker.is_alive():
+        return False, None
+    if "error" in box:
+        raise box["error"]
+    return True, box.get("result")
+
+
 class _TrafficAccumulator:
     """保存流量计数；按需保存脱敏后的资源明细，不保存 Header 或请求体。"""
 
@@ -736,6 +760,10 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
         self.context = context
         self._requests: dict[int, Any] = {}
         self._accounted_requests: set[int] = set()
+        # 事件回调里禁止任何 Playwright 同步 round-trip（sizes()/response() 等），
+        # 否则请求风暴下会与导航/求值重入，把传输层 wedge 住。回调只暂存对象，
+        # 所有读取推迟到 stop()（listeners 已摘除的工作线程上下文）执行。
+        self._staged_requests: dict[int, tuple[Any, bool]] = {}
         self._websockets: dict[int, Any] = {}
         self._websocket_stats: dict[int, dict[str, Any]] = {}
         self._js_coverage_sessions: dict[int, tuple[Any, Any, str]] = {}
@@ -943,7 +971,23 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             detail_key=f"playwright:{request_id}",
         )
 
+    def _stage_request(self, request: Any, *, failed: bool) -> None:
+        """事件回调唯一入口：只暂存对象与失败标记，不触碰任何 Playwright API。"""
+        key = id(request)
+        with self._lock:
+            if key not in self._requests:
+                self._requests[key] = request
+                self.request_count += 1
+            self._staged_requests[key] = (request, failed)
+
     def _mark_request(self, request: Any, *, failed: bool) -> None:
+        """stop() 上下文执行记账（禁止在事件回调中调用）。
+
+        只读取 Playwright 缓存属性（url/method/resource_type/headers/post_data），
+        永不调用 sizes()/response()/all_headers() 等 round-trip API：
+        它们在特定请求上会永久挂起（传输层 wedge），且只能在创建线程调用。
+        因此下载字节记为未知（0），上传按请求头/体估算。
+        """
         key = id(request)
         with self._lock:
             if key in self._accounted_requests:
@@ -953,8 +997,6 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 self.request_count += 1
             self._requests[key] = request
 
-        # route.abort() 的请求没有真正发出；不能在 sizes() 不可用时把它估算成
-        # 已上传的请求头，否则省下来的流量会被统计口径重新加回来。
         try:
             blocked = bool(self._data_saver and self._data_saver.was_playwright_blocked(request))
         except Exception:
@@ -968,48 +1010,13 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             )
             return
 
-        # Playwright 文档明确说明：failed request 上 Request.sizes() 会抛错，且
-        # 其内部先调用 response()。更关键的是这里正处于 requestfailed 事件回调，
-        # 任何等待 Playwright 的同步调用都可能触发 API 重入并破坏 page.goto()。
-        if failed:
-            upload = self._request_fallback_upload(request)
-            self._add_http(upload, 0)
-            with self._lock:
-                self.unknown_size_request_count += 1
-                self.failed_request_count += 1
-            self._record_playwright_detail(
-                request,
-                request_id=key,
-                upload_bytes=upload,
-                failed=True,
-                include_response=False,
-            )
-            return
-
-        values = self._request_size_values(request)
-        if values is None:
-            # 极少数完成事件也可能拿不到 sizes()；此时只估算上传，且不再读取
-            # response，避免把统计异常传播给 Playwright 事件派发。
-            upload = self._request_fallback_upload(request)
-            self._add_http(upload, 0)
-            with self._lock:
-                self.unknown_size_request_count += 1
-                self.completed_request_count += 1
-            self._record_playwright_detail(
-                request,
-                request_id=key,
-                upload_bytes=upload,
-                include_response=False,
-            )
-            return
-
-        unknown = any(value is None for value in values.values())
-        upload = (values["requestBodySize"] or 0) + (values["requestHeadersSize"] or 0)
-        download = (values["responseBodySize"] or 0) + (values["responseHeadersSize"] or 0)
-        self._add_http(upload, download)
+        # route.abort() 的请求没有真正发出；不能在 sizes() 不可用时把它估算成
+        # 已上传的请求头，否则省下来的流量会被统计口径重新加回来。
+        # failed 请求同样只估算已发出的头/体（缓存属性，无 round-trip）。
+        upload = self._request_fallback_upload(request)
+        self._add_http(upload, 0)
         with self._lock:
-            if unknown:
-                self.unknown_size_request_count += 1
+            self.unknown_size_request_count += 1
             if failed:
                 self.failed_request_count += 1
             else:
@@ -1018,17 +1025,15 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             request,
             request_id=key,
             upload_bytes=upload,
-            download_bytes=download,
-            response_body_bytes=values["responseBodySize"] or 0,
-            response_header_bytes=values["responseHeadersSize"] or 0,
-            include_response=True,
+            failed=failed,
+            include_response=False,
         )
 
     def _on_request_finished(self, request: Any) -> None:
-        self._mark_request(request, failed=False)
+        self._stage_request(request, failed=False)
 
     def _on_request_failed(self, request: Any) -> None:
-        self._mark_request(request, failed=True)
+        self._stage_request(request, failed=True)
 
     def _on_websocket(self, websocket: Any) -> None:
         if self._stopped:
@@ -1085,6 +1090,7 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             )
 
     def _record_unfinished_playwright_requests(self) -> int:
+        """未完成请求只用缓存属性估算上传，不做任何 round-trip。"""
         unfinished = 0
         for key, request in list(self._requests.items()):
             with self._lock:
@@ -1106,24 +1112,13 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 )
                 continue
 
-            values = self._request_size_values(request) or {}
-            if values:
-                upload = (values.get("requestBodySize") or 0) + (values.get("requestHeadersSize") or 0)
-                download = (values.get("responseBodySize") or 0) + (values.get("responseHeadersSize") or 0)
-                include_response = True
-            else:
-                upload = self._request_fallback_upload(request)
-                download = 0
-                include_response = False
+            upload = self._request_fallback_upload(request)
             self._record_playwright_detail(
                 request,
                 request_id=key,
                 upload_bytes=upload,
-                download_bytes=download,
-                response_body_bytes=values.get("responseBodySize") or 0,
-                response_header_bytes=values.get("responseHeadersSize") or 0,
                 unfinished=True,
-                include_response=include_response,
+                include_response=False,
             )
             unfinished += 1
         return unfinished
@@ -1173,19 +1168,55 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 pass
         self._listeners.clear()
 
+    def _finalize_staged_requests(self) -> None:
+        """stop() 上下文执行：先摘除监听器，再对暂存请求做 sizes()/response 读取。
+
+        必须在工作线程调用，禁止在事件回调中调用。
+        """
+        with self._lock:
+            staged = list(self._staged_requests.items())
+            self._staged_requests.clear()
+        for key, (request, failed) in staged:
+            try:
+                self._mark_request(request, failed=failed)
+            except Exception as exc:
+                logger.debug(
+                    "[%s] 延迟记账请求失败，已跳过：%s: %s", self.label, type(exc).__name__, str(exc)[:180]
+                )
+
+    def _drain_playwright_reads(self) -> None:
+        """stop() 上下文执行全部 Playwright 读取（带外层超时熔断，见 stop）。"""
+        with self._lock:
+            staged_count = len(self._staged_requests)
+            pending_count = len(self._requests)
+        logger.info(
+            "[%s] 开始汇总流量：暂存 %s 条，未完成待查 %s 条",
+            self.label, staged_count, pending_count,
+        )
+        self._finalize_staged_requests()
+        # 同步 Playwright 的事件会在这里调用前完成；仍未完成的请求单独标记，
+        # 不伪造响应字节，避免把“估计值”误报成精确值。
+        self.unfinished_request_count = self._record_unfinished_playwright_requests()
+        self._prepare_request_details()
+        self._collect_playwright_js_coverage()
+        logger.info("[%s] 流量汇总读取完成", self.label)
+
     def stop(self) -> dict[str, Any]:
         if self._stopped:
             snapshot = self._finish_snapshot()
             self._log_snapshot(snapshot)
             return snapshot
-        # 同步 Playwright 的事件会在这里调用前完成；仍未完成的请求单独标记，
-        # 不伪造响应字节，避免把“估计值”误报成精确值。
         with self._lock:
             self._stopped = True
-        self.unfinished_request_count = self._record_unfinished_playwright_requests()
+        # 先摘除监听器，确保后续 sizes()/response 读取不在事件派发上下文中，
+        # 避免同步 API 重入把传输层 wedge 住。
         self._remove_listeners()
-        self._prepare_request_details()
-        self._collect_playwright_js_coverage()
+        ok, _ = run_with_timeout(self._drain_playwright_reads, 90.0, "drain")
+        if not ok:
+            logger.warning(
+                "[%s] 流量读取超时(90s)，传输层疑似冻结；使用已采集的部分数据继续，"
+                "不阻塞任务收尾", self.label
+            )
         snapshot = self._finish_snapshot()
         self._log_snapshot(snapshot)
         return snapshot

@@ -241,6 +241,35 @@ def shutdown_executor(wait: bool = True) -> None:
         ex.shutdown(wait=wait, cancel_futures=False)
 
 
+# Playwright sync API 在并发 launch 下偶发污染工作线程状态，后续该线程的
+# sync_playwright().start() 会持续报此错（单线程 5 连败实测）。一旦命中立即
+# 退役当前线程池：在跑任务不受影响（旧池继续跑完），后续提交使用全新线程。
+_THREAD_POISON_MARK = "sync api inside the asyncio loop"
+
+
+def _is_thread_poison_error(err_text: str) -> bool:
+    return _THREAD_POISON_MARK in str(err_text or "").lower()
+
+
+def recycle_executor_after_poison(reason: str = "") -> None:
+    """退役当前注册线程池，下批任务使用全新线程（在跑任务不受影响）。"""
+    global _executor
+    with _executor_lock:
+        old_executor = _executor
+        _executor = None
+        if old_executor is not None:
+            try:
+                old_executor.shutdown(wait=False, cancel_futures=False)
+            except Exception:
+                pass
+            _retired_executors.append(old_executor)
+    logger.warning(
+        "[Service] 检测到工作线程疑似被 Playwright 并发状态毒化，已退役线程池"
+        "（在跑任务继续，后续提交使用新线程）：%s",
+        str(reason or "")[:160],
+    )
+
+
 # ============================================================
 # 单任务执行：日志重定向到任务专属文件
 # ============================================================
@@ -352,6 +381,8 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 else:
                     _release_unconsumed_job_email(email_to_handle, str(err))
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
+                if _is_thread_poison_error(err):
+                    recycle_executor_after_poison(str(err))
     except StopRequested as exc:
         _release_unconsumed_job_email(email, str(exc))
         log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
@@ -383,6 +414,8 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
+        if _is_thread_poison_error(f"{type(exc).__name__}: {exc}"):
+            recycle_executor_after_poison(f"{type(exc).__name__}: {exc}")
     finally:
         _deactivate_job(job_id)
 
